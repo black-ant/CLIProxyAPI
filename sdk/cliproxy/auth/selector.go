@@ -839,6 +839,31 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	return isAuthBlockedForModelForRequest(nil, auth, model, now)
 }
 
+// authRenewableWithExpiredAccessToken reports whether an expired access token should stay
+// selectable because the credential can still renew itself automatically.
+// Tokens explicitly rejected by upstream, and grants that already failed terminally,
+// remain blocked so they cannot loop on permanent failures.
+func authRenewableWithExpiredAccessToken(ctx context.Context, auth *Auth, clientHeaders ...http.Header) bool {
+	if auth == nil || auth.RequiresSignIn {
+		return false
+	}
+	// Without any refresh token the credential cannot renew itself; keep it blocked.
+	if strings.TrimSpace(authRefreshToken(auth)) == "" && strings.TrimSpace(authSIWCTokenField(auth, "refresh_token")) == "" {
+		return false
+	}
+	tokenStr := strings.TrimSpace(authAccessTokenForRequest(ctx, auth, clientHeaders...))
+	if tokenStr == "" {
+		return false
+	}
+	if auth.RejectedAccessToken != "" && auth.RejectedAccessToken == tokenStr {
+		return false
+	}
+	if IsCodexUseSIWC(auth) && auth.isSIWCAccessTokenRejected(tokenStr) {
+		return false
+	}
+	return true
+}
+
 func isAuthBlockedForModelForRequest(ctx context.Context, auth *Auth, model string, now time.Time, clientHeaders ...http.Header) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
@@ -853,7 +878,13 @@ func isAuthBlockedForModelForRequest(ctx context.Context, auth *Auth, model stri
 		return true, blockReasonOther, time.Time{}
 	}
 	if exp, ok := auth.AccessTokenExpirationTimeForRequest(ctx, clientHeaders...); ok && !exp.IsZero() && !exp.After(now) {
-		return true, blockReasonOther, time.Time{}
+		// Expired access tokens stay selectable while the credential can still renew itself
+		// automatically, otherwise no request can ever reach the refresh path and the
+		// credential remains permanently unusable. Tokens rejected by upstream, or grants
+		// that already failed terminally, are still blocked below.
+		if !authRenewableWithExpiredAccessToken(ctx, auth, clientHeaders...) {
+			return true, blockReasonOther, time.Time{}
+		}
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
 		return true, blockReasonCooldown, auth.Quota.NextRecoverAt
@@ -1016,7 +1047,11 @@ func isAuthBlockedByQuotaOrAuthForModelForRequest(ctx context.Context, auth *Aut
 		return true
 	}
 	if exp, ok := auth.AccessTokenExpirationTimeForRequest(ctx, clientHeaders...); ok && !exp.IsZero() && !exp.After(now) {
-		return true
+		// Keep affinity with an expired-but-renewable credential so its request can trigger
+		// the refresh path instead of forcing a rebind away from it.
+		if !authRenewableWithExpiredAccessToken(ctx, auth, clientHeaders...) {
+			return true
+		}
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && (auth.Quota.NextRecoverAt.IsZero() || auth.Quota.NextRecoverAt.After(now)) {
 		return true
