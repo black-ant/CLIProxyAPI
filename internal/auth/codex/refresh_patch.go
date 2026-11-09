@@ -91,7 +91,16 @@ func credentialFields(metadata map[string]any, keys []string) map[string]any {
 
 func sameCredentialVersion(a, b map[string]any) bool {
 	for _, key := range []string{"access_token", "refresh_token", "id_token", "account_id", "client_id", "device_id"} {
-		if !reflect.DeepEqual(a[key], b[key]) {
+		av, aExists := a[key]
+		bv, bExists := b[key]
+		// A version field present on only one side carries no comparison signal.
+		// Baselines are extracted from codexOuterCredentialKeys, which deliberately
+		// excludes client_id/device_id, so a strict both-sided comparison would never
+		// match a real credential file and the refreshed tokens would be discarded.
+		if !aExists || !bExists {
+			continue
+		}
+		if !reflect.DeepEqual(av, bv) {
 			return false
 		}
 	}
